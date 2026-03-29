@@ -33,13 +33,13 @@ def main():
     parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
     parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
     parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
-    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    parser.add_argument('--weight', default='sft_zhenhuan_final', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
     parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
     parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度（512=Small-26M, 640=MoE-145M, 768=Base-104M）")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量（Small/MoE=8, Base=16）")
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--use_moe', default=1, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
-    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--max_new_tokens', default=512, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
     parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
     parser.add_argument('--top_p', default=0.85, type=float, help="nucleus采样阈值（0-1）")
     parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
@@ -58,16 +58,25 @@ def main():
         '推荐一些中国的美食'
     ]
     
+    system_prompt = "你现在是《甄嬛传》中的华妃年世兰。你性格嚣张跋扈、美艳动人，仗着家世和恩宠不把任何人放在眼里。敢爱敢恨。说话风格：凌厉傲慢，常自称‘本宫’，金句频出。"
+    
     conversation = []
     model, tokenizer = init_model(args)
     input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
     
-    prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
+    prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬 皇上（你）: '), '')
     for prompt in prompt_iter:
-        setup_seed(2026) # or setup_seed(random.randint(0, 2048))
-        if input_mode == 0: print(f'💬: {prompt}')
+        setup_seed(2026) 
+        if input_mode == 0: print(f'💬 皇上（你）: {prompt}')
+        
+        # 处理历史记录
         conversation = conversation[-args.historys:] if args.historys else []
+        
+        # 【核心魔法】：如果对话是空的，立刻把华妃的灵魂塞进去！
+        if not conversation:
+            conversation.append({"role": "system", "content": system_prompt})
+            
         conversation.append({"role": "user", "content": prompt})
 
         templates = {"conversation": conversation, "tokenize": False, "add_generation_prompt": True}

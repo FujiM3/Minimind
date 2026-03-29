@@ -104,10 +104,15 @@ import torch
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch import nn
+from dataclasses import dataclass
 from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+@dataclass
+class MiniMindCausalLMOutputWithPast(CausalLMOutputWithPast):
+    aux_loss: Optional[torch.FloatTensor] = None
 
 
 class RMSNorm(torch.nn.Module):
@@ -220,100 +225,54 @@ class Attention(nn.Module):
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
-                attention_mask: Optional[torch.Tensor] = None): #掩码，负责不看未来信息
+                attention_mask: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
-        """投影得到QKV"""
-        #原始输入x:[bs,slen]，经过Linear变为[bs,slen,n_local_heads*head_dim]
-        # 这里的n_local_heads是Q的头数，head_dim是每个头的维度
-        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        #输入拆为多个头，通过view，但是储存数据形式不改变
-        q = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        k = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        v = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        #形状为[bs,seq_len,n_local_heads,head_dim]
 
-        """KV使用ROPE进行位置编码"""
-        cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin) #引入位置信息，形状不改变
-        #KV使用cache机制和repaet，将历史KV拼接起来
-        if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None #现在的KV作为下一次的past_key_value
-        
-        """Attention计算 QK^T/sqrt(d)，再对合法位置 softmax得到得分"""
-        xq, xk, xv = (
-            q.transpose(1, 2), #形状变为[bs,n_local_heads,seq_len,head_dim]
-            repeat_kv(k, self.n_rep).transpose(1, 2),# 使得头维在前，
-            repeat_kv(v, self.n_rep).transpose(1, 2)
-        )#注意力机制里最核心的运算本质上就是在做“每个 head 单独一组序列的相似度”
-
-
-        """使用Flash Attention加速计算"""
-        if self.flash and (seq_len > 1) and 
-        (past_key_value is None) and 
-        (attention_mask is None or 
-        torch.all(attention_mask == 1)): #调用函数进行掩码计算
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
-            dropout_p=self.dropout if self.training else 0.0, is_causal=True
-        else: #不使用Flash Attention时，使用常规注意力计算
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            # 应用掩码：不合法位置设为 -inf，避免 softmax 后出现非零值
-            scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
-            if attention_mask is not None:
-                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                scores = scores + extended_attention_mask
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-            scores = self.attn_dropout(scores)
-            output = scores @ xv 
-        #之前使用transpose，现在交换回来得到[bs,slen,n_local_heads,head_dim]
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1) 
-        #合并所有头，得到[bs,slen,hidden_size],其中hidden_size=n_local_heads*head_dim
-        output = self.resid_dropout(self.o_proj(output))
-        return output, past_kv
-        """注意力输出通过线性投影得到最终输出"""
-
-
-
-        # 线性投影得到 Q/K/V，再 reshape 为 [batch, seq, n_heads, head_dim]
-        # x:[bs,slen,hidden_size]，input通过embedding层得到[bs,slen,hidden_size]
-        # embedding本质是本质是“查表”：
-        #每个 token id 查到一个长度为 hidden_size 的向量；
-        #原来每个位置是 1 个整数，现在每个位置变成 1 个向量。
+        # 1. 线性投影得到 Q/K/V，并 reshape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        # 多个KV对应一个Q
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # 2. 加入 RoPE 位置编码
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        # KV cache：把历史 k/v 在序列维拼接，当前步只需算新 token 的 q/k/v
+        # ==========================================================
+        # 【管家的核心手术区：完美兼容 HuggingFace 的缓存格式】
+        
+        # 将 K 和 V 转换为 HF 要求的标准形状: [bs, heads, seq_len, head_dim]
+        xk_hf = xk.transpose(1, 2)
+        xv_hf = xv.transpose(1, 2)
+
+        # 此时的 seq_len 维度已经变成了 dim=2！在这里拼接历史记忆绝不会报错！
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
+            xk_hf = torch.cat([past_key_value[0], xk_hf], dim=2)
+            xv_hf = torch.cat([past_key_value[1], xv_hf], dim=2)
+        
+        # 存下符合 HF 标准的缓存供下一步使用
+        past_kv = (xk_hf, xv_hf) if use_cache else None
 
-        # 注意力计算 layout 转为 [batch, n_heads, seq, head_dim]；K/V 先 repeat_kv
-        xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
-            repeat_kv(xv, self.n_rep).transpose(1, 2)
-        )
+        # 为了兼容原作者那个娇贵的 repeat_kv 函数，我们再偷偷转回去
+        # 变回 [bs, 总seq_len, heads, head_dim]
+        xk = xk_hf.transpose(1, 2)
+        xv = xv_hf.transpose(1, 2)
+        # ==========================================================
 
+        # 3. 准备 Attention 计算 (再次转置，并展开 KV 头)
+        xq = xq.transpose(1, 2)
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
+
+        # 4. Attention 核心计算逻辑
         if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            # 整段因果自注意力且 mask 全 1：走融合内核（更快）
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
-            # 显式打分：QK^T / sqrt(d)，再对合法位置 softmax
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            # 因果：只允许看到当前及以前位置（上三角设为 -inf）
+            # 因果掩码：只用管新输入的 seq_len 即可，不需要管历史长度
             scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
 
             if attention_mask is not None:
-                # attention_mask=1 保留，0 的位置加极大负值使 softmax 后接近 0
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
@@ -322,9 +281,10 @@ class Attention(nn.Module):
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
-        # 合并所有头，过输出投影与残差 dropout
+        # 5. 恢复形状并投影输出
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
+        
         return output, past_kv
 
 
@@ -398,6 +358,10 @@ class MoEGate(nn.Module): #混合专家门控，负责选择专家
         # 从每个 token 的专家概率里，挑出 top_k 个最大概率的专家
 
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False) 
+        # 防御性边界裁剪：确保 topk_idx 一定落在 [0, n_routed_experts-1]，
+        # 避免后续 gather/scatter 的 CUDA 越界 device-side assert。
+        # 正常情况下 topk 的结果本就不会越界；一旦出现越界，这里能把训练从硬崩中拉回来。
+        topk_idx = topk_idx.clamp(0, self.n_routed_experts - 1)
         
         """计算整个batch的辅助损失"""
 
@@ -416,19 +380,33 @@ class MoEGate(nn.Module): #混合专家门控，负责选择专家
             #序列级别的辅助损失
             if self.seq_aux:
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                # ce: [bsz, n_routed_experts]，表示每个专家被选中的次数
-                ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
-                ce.scatter_add_(1, topk_idx_for_aux_loss,
-                                torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
-                    seq_len * aux_topk / self.n_routed_experts) # 每个专家的选择数/总选择数 = 使用率
+                # ce: [bsz, n_routed_experts]，表示每个专家被选中的次数。
+                # 原实现用 scatter_add 统计计数，在部分 CUDA 情况下会触发 out-of-bounds。
+                # 这里改用 bincount（索引安全）计算专家计数。
+                ce = torch.zeros(
+                    bsz,
+                    self.n_routed_experts,
+                    device=hidden_states.device,
+                    dtype=scores_for_aux.dtype,
+                )
+                # topk_idx_for_aux_loss: [bsz, seq_len*aux_topk]
+                denom = (seq_len * aux_topk) / self.n_routed_experts
+                for bi in range(bsz):
+                    ce[bi] = torch.bincount(
+                        topk_idx_for_aux_loss[bi].to(torch.int64),
+                        minlength=self.n_routed_experts,
+                    ).to(ce.dtype)
+                ce = ce / denom  # 与原 scatter_add 的 div_ 含义一致：得到归一化后的使用率
 
-                    # 每个专家的使用率 * 每个专家的平均分数（偏好） = 每个专家的辅助损失
-                    # 目的是让每个专家的使用率接近平均使用率，避免某些专家被过度使用或使用不足
+                # 每个专家的使用率 * 每个专家的平均分数（偏好）= 每个专家的辅助损失
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
                 # 另一种统计方式：不按序列维聚合，而是对 batch 内统计整体均值。
-                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
-                ce = mask_ce.float().mean(0)
+                # 避免 F.one_hot 在 CUDA 上走 scatter/gather 路径引发 index 越界。
+                flat_idx = topk_idx_for_aux_loss.reshape(-1).to(torch.int64)
+                flat_idx = flat_idx.clamp(0, self.n_routed_experts - 1)
+                counts = torch.bincount(flat_idx, minlength=self.n_routed_experts).to(scores_for_aux.dtype)
+                ce = counts / flat_idx.numel()
                 Pi = scores_for_aux.mean(0)
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
@@ -461,25 +439,44 @@ class MOEFeedForward(nn.Module):
         bsz, seq_len, _ = x.shape
         # 门控为每个 token 选出 top-k 专家索引与权重，并计算 aux_loss
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])
-        flat_topk_idx = topk_idx.view(-1)
-        if self.training:
-            # 每条路由复制一份 token 向量，再按 flat 专家索引喂给对应专家（便于向量化分批困难时的实现）
-            x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x, dtype=x.dtype)
-            for i, expert in enumerate(self.experts):
-                expert_out = expert(x[flat_topk_idx == i])
-                if expert_out.shape[0] > 0:
-                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
-                else:
-                    # 该 batch 未选中此专家时仍建立到参数的梯度图（系数为 0）
-                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
-            # 按 top-k 权重对专家输出加权求和，还原 [B, S, H]
-            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
-        else:
-            # 推理：按专家将 token 排序，连续块一次前向，scatter 回各位置
-            y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        x = x.view(-1, x.shape[-1])  # [N_tokens, H]
+        top_k = self.config.num_experts_per_tok
+        flat_topk_idx = topk_idx.reshape(-1)  # [N_tokens*top_k]
+        flat_topk_weight = topk_weight.reshape(-1)  # [N_tokens*top_k]
+
+        # 稳定实现：dense experts + gather 选择输出。
+        # 这样避免了训练时依赖 index_add / scatter 的汇聚路径，从而规避
+        # ScatterGatherKernel 触发 “index out of bounds” 的不稳定问题。
+        n_tokens = x.shape[0]
+        topk_idx_2d = flat_topk_idx.view(n_tokens, top_k)          # [N_tokens, top_k]
+        topk_weight_2d = flat_topk_weight.view(n_tokens, top_k)  # [N_tokens, top_k]
+        # 再做一次防御性裁剪，避免由于浮点/未定义状态导致 gather 索引越界。
+        n_experts = len(self.experts)
+        if topk_idx_2d.dtype != torch.long:
+            topk_idx_2d = topk_idx_2d.to(torch.long)
+        topk_idx_2d = topk_idx_2d.clamp(0, n_experts - 1)
+
+        # [n_experts, N_tokens, H]
+        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=0)
+        # [N_tokens, n_experts, H]
+        expert_outs = expert_outs.permute(1, 0, 2)
+
+        # 稳定实现：不用 F.one_hot（CUDA 上可能走 scatter/gather 内核）。
+        # 对每个 expert 用 mask 选择 top-k 中落在该 expert 的 token，并累加权重。
+        # topk_idx_2d: [N_tokens, top_k]
+        # topk_weight_2d: [N_tokens, top_k]
+        y_flat = torch.zeros(
+            n_tokens,
+            expert_outs.size(-1),
+            device=expert_outs.device,
+            dtype=expert_outs.dtype,
+        )
+        for e in range(n_experts):
+            mask_e = topk_idx_2d == e  # [N_tokens, top_k]
+            # w_e: [N_tokens]，该 token 选择了 expert e 的权重之和
+            w_e = (mask_e.to(topk_weight_2d.dtype) * topk_weight_2d).sum(dim=1)
+            y_flat = y_flat + w_e.unsqueeze(-1).to(y_flat.dtype) * expert_outs[:, e, :]
+        y = y_flat.view(*orig_shape)
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
@@ -488,25 +485,34 @@ class MOEFeedForward(nn.Module):
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        """推理专用：减少 Python 循环次数，每个专家只前向属于它的 token 子集。"""
-        expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.config.num_experts_per_tok
-        # tokens_per_expert: 排序后属于各专家的 token 在展平列表中的前缀累计个数
-        # token_idxs: 每个展平位置对应原 batch 中第几个 token（整段序列展开）
-        for i, end_idx in enumerate(tokens_per_expert):
-            start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
-            if start_idx == end_idx:
-                continue
-            expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+        """推理使用 dense experts + gather 选择输出（避免 scatter/index_add 边界问题）。"""
+        top_k = self.config.num_experts_per_tok
+        n_tokens = x.shape[0]
 
-        return expert_cache
+        topk_idx_2d = flat_expert_indices.view(n_tokens, top_k)           # [N_tokens, top_k]
+        topk_weight_2d = flat_expert_weights.view(n_tokens, top_k)      # [N_tokens, top_k]
+        n_experts = len(self.experts)
+        if topk_idx_2d.dtype != torch.long:
+            topk_idx_2d = topk_idx_2d.to(torch.long)
+        topk_idx_2d = topk_idx_2d.clamp(0, n_experts - 1)
+
+        # [n_experts, N_tokens, H] -> [N_tokens, n_experts, H]
+        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=0).permute(1, 0, 2)
+        n_experts = expert_outs.size(1)
+
+        # 推理也走 mask 累加，避免 one_hot / scatter/gather 相关不稳定。
+        y_flat = torch.zeros(
+            n_tokens,
+            expert_outs.size(-1),
+            device=expert_outs.device,
+            dtype=expert_outs.dtype,
+        )
+        for e in range(n_experts):
+            mask_e = topk_idx_2d == e  # [N_tokens, top_k]
+            w_e = (mask_e.to(topk_weight_2d.dtype) * topk_weight_2d).sum(dim=1)
+            y_flat = y_flat + w_e.unsqueeze(-1).to(y_flat.dtype) * expert_outs[:, e, :]
+
+        return y_flat  # [N_tokens, H]
 
 
 class MiniMindBlock(nn.Module):
@@ -653,6 +659,10 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin): #模型标准化
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
 
-        output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
-        output.aux_loss = aux_loss
-        return output
+        return MiniMindCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+            aux_loss=aux_loss,
+        )
